@@ -1,17 +1,19 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Box, Typography, Paper, Container, CircularProgress, Alert } from '@mui/material';
+import { Box, Typography, Paper, Container, CircularProgress, Alert, Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions, Button } from '@mui/material';
 import SpeechRecognition, { useSpeechRecognition } from 'react-speech-recognition';
 import { chatWithAssistant } from '../services/openai';
-
-interface Message {
-  role: 'assistant' | 'user';
-  content: string;
-}
+import { analyzeAssistantResponse } from '../services/responseAnalyzer';
+import { saveMedicalRecord } from '../services/api';
+import { Message } from '../types';
 
 const VirtualConsultation: React.FC = () => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [consultationEnded, setConsultationEnded] = useState(false);
+  const [patientName, setPatientName] = useState<string>('');
+  const [showSummaryDialog, setShowSummaryDialog] = useState(false);
+  const [consultationSummary, setConsultationSummary] = useState<string | null>(null);
   
   // Referências para controle de estados
   const lastSignificantTranscriptRef = useRef("");
@@ -30,10 +32,10 @@ const VirtualConsultation: React.FC = () => {
     browserSupportsSpeechRecognition 
   } = useSpeechRecognition();
 
-  // Constantes otimizadas para detecção automática - AJUSTADAS
-  const SILENCE_THRESHOLD = 2000; // 2.0 segundos de silêncio para finalizar
-  const MIN_SPEECH_LENGTH = 3; // REDUZIDO: Mínimo de caracteres para considerar como fala real (era 5)
-  const SIGNIFICANT_CHANGE_THRESHOLD = 5; // REDUZIDO: Mudança significativa (era 8)
+  // Constantes otimizadas para detecção automática
+  const SILENCE_THRESHOLD = 5000; // 5.0 segundos de silêncio para finalizar
+  const MIN_SPEECH_LENGTH = 3; // Mínimo de caracteres para considerar como fala real
+  const SIGNIFICANT_CHANGE_THRESHOLD = 5; // Mudança significativa
   const MAX_NOISE_COUNT = 3; // Máximo de ruídos consecutivos antes de resetar
   const INACTIVE_RESET_TIME = 10000; // 10 segundos sem atividade para resetar o estado
 
@@ -83,8 +85,8 @@ const VirtualConsultation: React.FC = () => {
 
   // Monitor de mudanças no transcript 
   useEffect(() => {
-    if (!listening) {
-      console.log('[SPEECH] Não está escutando ativamente');
+    if (!listening || consultationEnded) {
+      console.log('[SPEECH] Não está escutando ativamente ou consulta encerrada');
       return;
     }
     
@@ -158,7 +160,7 @@ const VirtualConsultation: React.FC = () => {
           const cleanedTranscript = transcript.trim();
           console.log(`[SPEECH] Transcript estável detectado: "${cleanedTranscript}"`);
           
-          // MODIFICADO: Verificação menos rigorosa para fala significativa
+          // Verificação para fala significativa
           const isMeaningfulSpeech = 
             cleanedTranscript.length >= MIN_SPEECH_LENGTH * 2 && // Comprimento mínimo
             containsWordLikePattern(cleanedTranscript); // Parece conter palavras reais
@@ -172,8 +174,7 @@ const VirtualConsultation: React.FC = () => {
             setIsSpeaking(false);
             processUserSpeech(cleanedTranscript);
           } else {
-            // MODIFICADO: Se o texto contiver certas palavras-chave, considerar como significativo mesmo que não passe
-            // nos critérios normais
+            // Se o texto contiver certas palavras-chave, considerar como significativo
             if (containsNameIndication(cleanedTranscript)) {
               console.log('[SPEECH] Fala contém indicação de nome, processando mesmo sem critérios completos...');
               setIsSpeaking(false);
@@ -187,9 +188,9 @@ const VirtualConsultation: React.FC = () => {
         }
       }, SILENCE_THRESHOLD);
     }
-  }, [transcript, listening, isSpeaking]);
+  }, [transcript, listening, isSpeaking, consultationEnded]);
 
-  // NOVA FUNÇÃO: Verifica se o texto contém indicações de nome
+  // Verifica se o texto contém indicações de nome
   const containsNameIndication = (text: string) => {
     const lowerText = text.toLowerCase();
     const nameIndicators = ['nome', 'chamo', 'sou o', 'sou a', 'me chamo', 'meu nome'];
@@ -209,7 +210,7 @@ const VirtualConsultation: React.FC = () => {
     const containsConsonants = /[bcdfghjklmnpqrstvwxyz]/i.test(text);
     const containsSpaces = text.includes(' ');
     
-    // MODIFICADO: Critério menos rigoroso para palavras reais
+    // Critério para palavras reais
     const result = containsVowels && containsConsonants && (containsSpaces || text.length > 8);
     console.log(`[SPEECH] Análise de padrão de palavra: "${text}" - Resultado: ${result}`);
     return result;
@@ -232,13 +233,44 @@ const VirtualConsultation: React.FC = () => {
     }
   };
 
+  // Extrai o nome do paciente da mensagem
+  const extractPatientName = (message: string): string | null => {
+    // Padrões comuns para extração de nome
+    const patterns = [
+      /meu nome é ([a-zçáàâãéèêíìîóòôõúùû\s]+)/i,
+      /me chamo ([a-zçáàâãéèêíìîóòôõúùû\s]+)/i,
+      /sou ([a-zçáàâãéèêíìîóòôõúùû\s]+)/i,
+      /nome ([a-zçáàâãéèêíìîóòôõúùû\s]+)/i
+    ];
+    
+    for (const pattern of patterns) {
+      const match = message.match(pattern);
+      if (match && match[1]) {
+        // Limpa o nome extraído
+        const name = match[1].trim().replace(/[,.!?].*$/, '');
+        return name;
+      }
+    }
+    
+    return null;
+  };
+
   const processUserSpeech = async (userTranscript: string) => {
-    if (!userTranscript.trim()) {
-      console.log('[PROCESS] Transcript vazio, ignorando processamento');
+    if (!userTranscript.trim() || consultationEnded) {
+      console.log('[PROCESS] Transcript vazio ou consulta encerrada, ignorando processamento');
       return;
     }
     
     console.log(`[PROCESS] Iniciando processamento da fala: "${userTranscript}"`);
+    
+    // Tenta extrair o nome do paciente se ainda não tiver sido definido
+    if (!patientName) {
+      const extractedName = extractPatientName(userTranscript);
+      if (extractedName) {
+        setPatientName(extractedName);
+        console.log(`[PROCESS] Nome do paciente extraído: ${extractedName}`);
+      }
+    }
     
     // Adiciona a mensagem do usuário
     const userMessage: Message = {
@@ -268,6 +300,44 @@ const VirtualConsultation: React.FC = () => {
       
       setMessages(prev => [...prev, assistantMessage]);
       console.log('[CHAT] Resposta do assistente adicionada ao histórico');
+      
+      // Analisa a resposta para verificar se a consulta deve ser encerrada
+      const analysisResult = analyzeAssistantResponse(response || '');
+      console.log('[ANALYSIS] Resultado da análise:', analysisResult);
+      
+      if (analysisResult.isConsultationEnding) {
+        console.log('[CONSULTATION] Consulta será encerrada');
+        setConsultationEnded(true);
+        setConsultationSummary(analysisResult.summary);
+        
+        // Salva o prontuário no banco de dados
+        try {
+          // Extrai sintomas e histórico médico das mensagens
+          const allMessages = [...messages, userMessage, assistantMessage];
+          const symptoms = extractSymptoms(allMessages);
+          const medicalHistory = extractMedicalHistory(allMessages);
+          
+          const medicalRecordData = {
+            patientName: patientName || 'Paciente sem nome',
+            symptoms: symptoms || 'Não informado',
+            medicalHistory: medicalHistory || 'Não informado',
+            recommendation: extractRecommendation(response || '') || 'Não informado',
+            specialtyReferral: analysisResult.specialtyReferral || '',
+            emergencyReferral: analysisResult.isEmergency,
+            summary: analysisResult.summary || response || '',
+            conversationHistory: allMessages
+          };
+          
+          console.log('[DB] Salvando prontuário:', medicalRecordData);
+          await saveMedicalRecord(medicalRecordData);
+          console.log('[DB] Prontuário salvo com sucesso');
+          
+          // Mostra o diálogo com o resumo
+          setShowSummaryDialog(true);
+        } catch (error) {
+          console.error('[DB] Erro ao salvar prontuário:', error);
+        }
+      }
     } catch (error) {
       console.error('[CHAT] Erro ao processar mensagem:', error);
       const errorMessage: Message = {
@@ -285,10 +355,99 @@ const VirtualConsultation: React.FC = () => {
       consecutiveNoiseCountRef.current = 0;
       console.log('[PROCESS] Estado de reconhecimento resetado');
       
-      // Reiniciar o reconhecimento após o processamento
-      console.log('[SPEECH] Reiniciando reconhecimento após processamento');
-      startListening();
+      // Reiniciar o reconhecimento após o processamento, se a consulta não tiver sido encerrada
+      if (!consultationEnded) {
+        console.log('[SPEECH] Reiniciando reconhecimento após processamento');
+        startListening();
+      } else {
+        console.log('[SPEECH] Consulta encerrada, não reiniciando reconhecimento');
+      }
     }
+  };
+
+  // Extrai sintomas das mensagens
+  const extractSymptoms = (messages: Message[]): string => {
+    // Procura por mensagens do usuário que mencionam sintomas
+    const userMessages = messages.filter(m => m.role === 'user').map(m => m.content);
+    const symptomsPatterns = [
+      /sint[o|omas]+ ([^.]+)/i,
+      /sent[ir|indo]+ ([^.]+)/i,
+      /d[ó|o|oi]+ ([^.]+)/i,
+      /problema[s]? ([^.]+)/i
+    ];
+    
+    for (const message of userMessages) {
+      for (const pattern of symptomsPatterns) {
+        const match = message.match(pattern);
+        if (match && match[1]) {
+          return match[1].trim();
+        }
+      }
+    }
+    
+    return '';
+  };
+
+  // Extrai histórico médico das mensagens
+  const extractMedicalHistory = (messages: Message[]): string => {
+    // Procura por mensagens do usuário que mencionam histórico médico
+    const userMessages = messages.filter(m => m.role === 'user').map(m => m.content);
+    const historyPatterns = [
+      /j[á|a] tive ([^.]+)/i,
+      /hist[ó|o]ri[co|a]+ ([^.]+)/i,
+      /diagn[ó|o]stic[o|ado]+ ([^.]+)/i,
+      /tratamento ([^.]+)/i,
+      /medica[ção|mento]+ ([^.]+)/i
+    ];
+    
+    for (const message of userMessages) {
+      for (const pattern of historyPatterns) {
+        const match = message.match(pattern);
+        if (match && match[1]) {
+          return match[1].trim();
+        }
+      }
+    }
+    
+    return '';
+  };
+
+  // Extrai recomendação da resposta do assistente
+  const extractRecommendation = (response: string): string => {
+    const recommendationPatterns = [
+      /recomend[o|amos]+ ([^.]+)/i,
+      /suger[e|imos]+ ([^.]+)/i,
+      /aconselh[o|amos]+ ([^.]+)/i,
+      /indic[o|amos]+ ([^.]+)/i
+    ];
+    
+    for (const pattern of recommendationPatterns) {
+      const match = response.match(pattern);
+      if (match && match[1]) {
+        return match[1].trim();
+      }
+    }
+    
+    return '';
+  };
+
+  // Reinicia a consulta
+  const handleRestartConsultation = () => {
+    setConsultationEnded(false);
+    setPatientName('');
+    setShowSummaryDialog(false);
+    setConsultationSummary(null);
+    setMessages([
+      {
+        role: 'assistant',
+        content: 'Olá! Sou seu assistente virtual de triagem médica. Por favor, me diga seu nome para começarmos.'
+      }
+    ]);
+    resetTranscript();
+    lastSignificantTranscriptRef.current = "";
+    lastTranscriptLengthRef.current = 0;
+    consecutiveNoiseCountRef.current = 0;
+    startListening();
   };
 
   // Log quando o estado de escuta muda
@@ -337,7 +496,19 @@ const VirtualConsultation: React.FC = () => {
         </Paper>
 
         <Box sx={{ mb: 2 }}>
-          {isSpeaking ? (
+          {consultationEnded ? (
+            <Alert severity="info">
+              Consulta encerrada. {patientName ? `Obrigado, ${patientName}!` : 'Obrigado!'} 
+              <Button 
+                variant="outlined" 
+                size="small" 
+                sx={{ ml: 2 }} 
+                onClick={handleRestartConsultation}
+              >
+                Iniciar Nova Consulta
+              </Button>
+            </Alert>
+          ) : isSpeaking ? (
             <Alert severity="info">Ouvindo você falar...</Alert>
           ) : isLoading ? (
             <Alert severity="warning">Processando sua mensagem...</Alert>
@@ -346,7 +517,7 @@ const VirtualConsultation: React.FC = () => {
           )}
         </Box>
         
-        {transcript && (
+        {transcript && !consultationEnded && (
           <Paper sx={{ p: 2, mb: 2, backgroundColor: '#e8f5e9' }}>
             <Typography variant="body1">
               <strong>Transcrição em tempo real:</strong> {transcript}
@@ -354,6 +525,32 @@ const VirtualConsultation: React.FC = () => {
           </Paper>
         )}
       </Box>
+
+      {/* Diálogo de resumo da consulta */}
+      <Dialog
+        open={showSummaryDialog}
+        onClose={() => setShowSummaryDialog(false)}
+        aria-labelledby="consultation-summary-dialog"
+      >
+        <DialogTitle id="consultation-summary-dialog">Resumo da Consulta</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            {consultationSummary ? (
+              <div dangerouslySetInnerHTML={{ __html: consultationSummary.replace(/\n/g, '<br/>') }} />
+            ) : (
+              'Consulta finalizada. Os dados foram salvos.'
+            )}
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setShowSummaryDialog(false)} color="primary">
+            Fechar
+          </Button>
+          <Button onClick={handleRestartConsultation} color="primary" variant="contained">
+            Nova Consulta
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Container>
   );
 };
